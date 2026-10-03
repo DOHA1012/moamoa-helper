@@ -22,7 +22,7 @@ const store = {
 };
 const settings = {
   strength: store.get('strength', '끝판'),
-  rotDir: store.get('rotDir', 'cw'),       // 게임의 [회전]은 시계 방향, [반전]은 위아래 (데스크톱 버전이 실제 게임에서 배운 값)
+  rotDir: store.get('rotDir', 'cw'),       // 게임의 [회전]은 시계 방향, [반전]은 위아래 (실제 게임에서 확인한 값)
   flipAxis: store.get('flipAxis', 'v'),
 };
 if (!STRENGTH[settings.strength]) settings.strength = '끝판';
@@ -77,7 +77,7 @@ async function decide(state) {
   return r.res;
 }
 
-// ---------------------------------------------------------------- 계획 이어가기 (데스크톱 bot.think/advise와 같은 규칙)
+// ---------------------------------------------------------------- 계획 이어가기
 const newCtx = () => ({ plan: null, next: 0, expect: null, history: [], pending: null, note: '', computing: false });
 const handSig = hand => hand.map((b, k) => (b >= 0 ? `${k}:${b}` : '')).filter(Boolean).sort().join(',');
 

@@ -1,4 +1,4 @@
-// 최적화 엔진(WebAssembly) 연결 — 데스크톱의 engine/engine.c와 같은 코드를 wasm으로 빌드한 것.
+// 최적화 엔진(WebAssembly) 연결 — C 엔진(engine.c)을 wasm으로 빌드한 것.
 // 구조체는 wasm 메모리의 작업 영역(mm_scratch)에 써서 주고받는다.
 import { BLOCKS, WEIGHTS, STAGE_PROBS } from './data.js';
 
