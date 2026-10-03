@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>모아모아 도우미</title>
+<meta name="description" content="메이플스토리 이벤트 미니게임 '한글 모아모아' — 화면을 보고 놓을 자리·순서·회전 횟수를 알려주는 웹 도우미">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <div class="brand">
+      <svg width="30" height="30" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#151c29"/><rect x="5" y="5" width="10" height="10" rx="2" fill="#facc15"/><rect x="17" y="5" width="10" height="10" rx="2" fill="#f472b6"/><rect x="5" y="17" width="10" height="10" rx="2" fill="#84cc16"/><rect x="17" y="17" width="10" height="10" rx="2" fill="#38bdf8"/></svg>
+      <h1>한글 모아모아 도우미</h1>
+      <span class="ver" id="ver"></span>
+    </div>
+    <nav class="tabs" role="tablist" aria-label="사용 방법">
+      <button role="tab" id="tab-btn-live" aria-controls="tab-live" aria-selected="true">실시간 화면 공유</button>
+      <button role="tab" id="tab-btn-edit" aria-controls="tab-edit" aria-selected="false">스크린샷 · 직접 입력</button>
+    </nav>
+    <div class="grow"></div>
+    <label class="strength">계산 세기
+      <select id="strength">
+        <option>빠름</option><option>보통</option><option>강함</option><option>최강</option><option>극한</option><option>끝판</option>
+      </select>
+    </label>
+  </div>
+</header>
+
+<main class="wrap">
+  <p class="notice">웹 버전은 게임을 조작하지 않아요. 게임 화면을 보고 <b>놓을 자리 · 순서 · 회전/반전 횟수</b>만 알려 줘요.
+    화면과 이미지는 이 브라우저 안에서만 처리되고 어디로도 전송되지 않아요.</p>
+
+  <!-- 실시간 화면 공유 -->
+  <section class="tab" id="tab-live" role="tabpanel" aria-labelledby="tab-btn-live" style="margin-top:14px">
+    <div class="stage card" id="hud-home">
+      <div class="live-empty" id="live-empty">
+        <h3>게임 창을 공유하면 바로 읽어요</h3>
+        <ol>
+          <li>메이플스토리를 <b>창 모드</b>로 두고 한글 모아모아 이벤트 창을 열어 주세요.</li>
+          <li><b>화면 공유 시작</b>을 누르고 <b>창</b> 탭에서 MapleStory 창(또는 화면 전체)을 고르세요.</li>
+          <li>판과 오른쪽 조각 패널이 보이면 자동으로 찾아서, 놓을 자리와 순서를 그려 줘요.</li>
+          <li><b>항상 위 HUD 창</b>을 띄우면 게임 옆에 작은 창으로 계속 볼 수 있어요 (Chrome·Edge).</li>
+        </ol>
+      </div>
+      <div class="hud" id="hud" hidden>
+        <canvas id="live-cv" width="600" height="640" aria-label="게임 화면과 추천 배치"></canvas>
+        <ol class="plan" id="live-plan"></ol>
+        <div class="ability-line" id="live-ability"></div>
+      </div>
+      <div class="pip-home" id="pip-home" hidden>HUD가 별도의 작은 창에 떠 있어요. 그 창을 닫으면 여기로 돌아와요.</div>
+    </div>
+
+    <aside class="side">
+      <div class="card">
+        <h2>화면 공유</h2>
+        <div class="row stretch">
+          <button class="btn primary" id="share-btn">화면 공유 시작</button>
+          <button class="btn" id="pip-btn" disabled>항상 위 HUD 창</button>
+        </div>
+        <p class="status" id="live-status">아직 공유 중이 아니에요.</p>
+        <div class="row">
+          <button class="btn small" id="refind-btn" disabled>판 다시 찾기</button>
+          <button class="btn small" id="to-editor-btn" disabled>지금 화면을 편집기로</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>능력 보정 (잘못 읽혔을 때만)</h2>
+        <div class="fields">
+          <label>점 찍기 <input type="number" id="fix-dots" min="0" max="7" inputmode="numeric" placeholder="자동"></label>
+          <label>바꿔 뽑기 <input type="number" id="fix-swaps" min="0" max="7" inputmode="numeric" placeholder="자동"></label>
+          <label>다음 능력까지 <input type="number" id="fix-next" min="1" max="7" inputmode="numeric" placeholder="자동"></label>
+          <label>&nbsp;<button class="btn small" id="fix-btn">적용</button></label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>게임 버튼 방향</h2>
+        <div class="learn">
+          <label>[회전] 버튼
+            <select id="rot-dir"><option value="cw">시계 방향</option><option value="ccw">반시계 방향</option><option value="">모름 (화면 보고 배우기)</option></select>
+          </label>
+          <label>[반전] 버튼
+            <select id="flip-axis"><option value="v">위아래 뒤집기</option><option value="h">좌우 뒤집기</option><option value="">모름 (화면 보고 배우기)</option></select>
+          </label>
+        </div>
+      </div>
+
+      <details class="help card" style="padding:14px">
+        <summary>잘 안 될 때</summary>
+        <ul>
+          <li>게임판을 못 찾으면: 이벤트 창 전체(판 + 오른쪽 조각 패널)가 보이게 하고 <b>판 다시 찾기</b>를 누르세요.</li>
+          <li>전체 화면(독점 모드)은 공유가 안 될 수 있어요. 창 모드나 창 전체화면을 쓰세요.</li>
+          <li>마우스로 조각을 들고 판 위에 올려 둔 동안은 판을 읽지 않고 기다려요.</li>
+          <li>HUD 창을 게임 창 위에 겹치면 공유 화면에 HUD가 찍혀서 읽기를 방해할 수 있어요. 게임 옆에 두세요(창 공유라면 괜찮아요).</li>
+          <li>자동 클릭까지 하는 버전은 Windows용 데스크톱 프로그램(MoamoaHelper.exe)이에요.</li>
+        </ul>
+      </details>
+    </aside>
+  </section>
+
+  <!-- 스크린샷 · 직접 입력 -->
+  <section class="tab" id="tab-edit" role="tabpanel" aria-labelledby="tab-btn-edit" hidden style="margin-top:14px">
+    <div class="stage card editor">
+      <div class="tools" role="radiogroup" aria-label="판 편집 도구">
+        <label><input type="radio" name="tool" value="fill" checked> 블록 칠하기/지우기</label>
+        <label><input type="radio" name="tool" value="dot"> ◎ 점 찍기 아이콘</label>
+        <label><input type="radio" name="tool" value="swap"> ⇄ 바꿔 뽑기 아이콘</label>
+      </div>
+      <canvas id="ed-cv" width="360" height="540" aria-label="게임판 편집기"></canvas>
+      <p class="hint-text">칸을 누르거나 끌어서 칠하고 지워요 (오른쪽 버튼 = 지우기). 아이콘은 빈 칸에 놓여요.</p>
+    </div>
+
+    <aside class="side">
+      <div class="card">
+        <h2>스크린샷으로 채우기</h2>
+        <div class="drop" id="drop">게임 화면을 <b>Ctrl+V</b>로 붙여넣거나 여기로 끌어다 놓으세요.
+          <div class="row" style="justify-content:center;margin-top:8px">
+            <button class="btn small" id="open-btn">이미지 열기</button>
+            <button class="btn small" id="sample-btn">예시 화면으로 해보기</button>
+          </div>
+          <input type="file" id="file-in" accept="image/*" hidden>
+        </div>
+        <p class="status" id="import-status"></p>
+      </div>
+
+      <div class="card">
+        <h2>가진 조각 (카드 모양 = 게임에 보이는 모양)</h2>
+        <div class="hand" id="ed-hand"></div>
+      </div>
+
+      <div class="card">
+        <h2>능력</h2>
+        <div class="fields">
+          <label>점 찍기 <input type="number" id="ed-dots" min="0" max="7" value="0" inputmode="numeric"></label>
+          <label>바꿔 뽑기 <input type="number" id="ed-swaps" min="0" max="7" value="0" inputmode="numeric"></label>
+          <label>다음 능력까지
+            <select id="ed-next"><option value="0">모름</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option selected>7</option></select>
+          </label>
+          <label>지금까지 지운 줄 <input type="number" id="ed-lines" min="0" value="0" inputmode="numeric"></label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>추천 순서</h2>
+        <ol class="plan" id="ed-plan"></ol>
+        <p class="status" id="ed-status"></p>
+        <div class="row stretch">
+          <button class="btn primary" id="apply-btn" disabled>다음 단계 적용 ▶</button>
+          <button class="btn" id="undo-btn" disabled>되돌리기</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn small" id="clear-btn">판 비우기</button>
+          <button class="btn small" id="replan-btn">다시 계산</button>
+        </div>
+      </div>
+    </aside>
+  </section>
+</main>
+
+<footer>
+  <span id="foot-ver"></span> · 같은 계산 엔진을 쓰는 Windows 데스크톱 버전은 자동 클릭도 지원해요.
+  · 넥슨·메이플스토리와 관계없는 팬 제작 도구예요.
+</footer>
+
+<dialog id="picker" aria-labelledby="picker-title">
+  <h3 id="picker-title">조각 고르기</h3>
+  <div class="pieces" id="pieces"></div>
+  <div class="row">
+    <button class="btn small" id="picker-none">빈 칸 (이미 씀)</button>
+    <button class="btn small" id="picker-close">닫기</button>
+  </div>
+</dialog>
+
+<video id="video" class="hidden-video" muted playsinline></video>
+<div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>
