@@ -47,7 +47,14 @@
         </ol>
       </div>
       <div class="hud" id="hud" hidden>
-        <canvas id="live-cv" width="600" height="640" aria-label="게임 화면과 추천 배치"></canvas>
+        <div class="live-banner" id="live-banner" role="status">화면 공유를 시작하세요</div>
+        <div class="live-stage">
+          <div class="live-view" id="live-view">
+            <video id="live-video" muted playsinline autoplay aria-label="공유 중인 게임 화면"></video>
+            <canvas id="live-cv" aria-label="추천 배치"></canvas>
+            <div class="live-msg" id="live-msg">공유 화면을 받는 중…</div>
+          </div>
+        </div>
         <ol class="plan" id="live-plan"></ol>
         <div class="ability-line" id="live-ability"></div>
       </div>
@@ -174,7 +181,6 @@
   </div>
 </dialog>
 
-<video id="video" class="hidden-video" muted playsinline></video>
 <div class="toast" id="toast" role="status" hidden></div>
 </body>
 </html>

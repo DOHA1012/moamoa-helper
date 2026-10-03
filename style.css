@@ -111,7 +111,19 @@ main.wrap { padding-top: 14px; padding-bottom: 40px; }
 /* 실시간 HUD */
 .stage { min-width: 0; }
 .hud { display: flex; flex-direction: column; gap: 10px; padding: 12px; }
-.hud canvas { width: 100%; height: auto; display: block; border-radius: 8px; background: var(--board); }
+.live-banner {
+  background: #0f172a; color: #fff; font-weight: 700; text-align: center; padding: 8px 12px;
+  border-radius: 8px; border-bottom: 2px solid #334155; font-size: 16px; min-height: 40px;
+}
+.live-banner.stuck { background: #7f1d1d; border-bottom-color: #ff3b3b; }
+.live-stage { display: flex; justify-content: center; }
+.live-view {
+  position: relative; overflow: hidden; background: var(--board); border-radius: 8px;
+  aspect-ratio: var(--ar, 1.6); width: min(100%, calc(78vh * var(--ar, 1.6)));
+}
+.live-view video { position: absolute; left: 0; top: 0; width: 100%; height: 100%; max-width: none; object-fit: fill; display: block; }
+.live-view canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.live-msg { position: absolute; inset: 0; display: grid; place-items: center; color: #cbd5e1; font-weight: 600; }
 .live-empty { padding: 26px 22px; color: var(--muted); }
 .live-empty h3 { color: var(--text); margin: 0 0 8px; font-size: 16px; }
 .live-empty ol { margin: 0; padding-left: 20px; }
@@ -182,7 +194,9 @@ video.hidden-video { position: fixed; left: -10000px; top: 0; width: 320px; heig
 /* 항상 위 HUD 창 (문서 PiP) */
 body.pip { margin: 0; background: var(--board); color: #e6eaf2; }
 body.pip .hud { padding: 6px; gap: 6px; height: 100vh; }
-body.pip .hud canvas { flex: 1 1 auto; min-height: 0; width: 100%; height: 0; object-fit: contain; border-radius: 0; }
+body.pip .live-banner { border-radius: 0; font-size: 14px; padding: 6px 8px; min-height: 0; }
+body.pip .live-stage { flex: 1 1 auto; min-height: 0; container-type: size; align-items: center; }
+body.pip .live-view { width: min(100cqw, calc(100cqh * var(--ar, 1.6))); border-radius: 0; }
 body.pip .plan li { background: #1b2433; font-size: 13px; padding: 4px 8px; }
 body.pip .ability-line { color: #93a0b8; }
 body.pip .plan li.now { outline-color: #22d3ee; }

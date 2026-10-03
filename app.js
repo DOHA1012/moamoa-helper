@@ -282,10 +282,13 @@ function renderPlanList(el, c, shapes) {
 }
 
 // ================================================================= 실시간 화면 공유
-// 미리보기는 매 프레임(최대 30fps) 그리고, 인식은 따로 쉬는 틈마다 돌린다 → 인식이 느려도 화면은 부드럽다.
+// 화면: 공유 영상(<video>)을 판 주변만 보이게 잘라 그대로 보여 준다 → 게임과 같은 프레임(최대 60fps)으로,
+// 브라우저가 직접 그리므로 JS가 매 프레임 일하지 않는다. 추천 표시는 그 위 투명 캔버스에 바뀔 때만 그린다.
+// 인식은 별도 작업자에서 쉬는 틈마다 판 주변만 잘라 읽는다.
 const live = {
-  stream: null, c: newCtx(), tracker: new Tracker(), lastSig: null, frame: null, view: null,
+  stream: null, anaTrack: null, c: newCtx(), tracker: new Tracker(), lastSig: null, frame: null,
   prevSlots: null, mode: null, pip: null, grid: null, margin: null, anaBusy: false, lastAna: 0,
+  region: null, videoPip: null,
 };
 live.tracker.learned = store.get('learned', { panel: [], badge: [] });
 vision.post({ cmd: 'learned', learned: live.tracker.learned });
@@ -294,6 +297,10 @@ vision.post({ cmd: 'learned', learned: live.tracker.learned });
   capture.post({ cmd: 'port', port: ch.port1 }, [ch.port1]);
   vision.post({ cmd: 'port', port: ch.port2 }, [ch.port2]);
 }
+const hudEls = {
+  hud: $('#hud'), view: $('#live-view'), video: $('#live-video'), cv: $('#live-cv'), msg: $('#live-msg'),
+  banner: $('#live-banner'), plan: $('#live-plan'), ability: $('#live-ability'),
+};
 
 function liveShapes() {
   const fr = live.frame;
@@ -313,44 +320,105 @@ function onVisionEvent(m) {
 }
 
 function onCaptureEvent(m) {
-  if (m.kind === 'view') onView(m.view);
-  else if (m.kind === 'tick') onTick();
+  if (m.kind === 'tick') onTick();
   else if (m.kind === 'ended') { if (live.stream) stopShare('공유가 끝났어요.'); }
   else if (m.kind === 'error') setLiveStatus('화면을 읽는 중 오류: ' + m.error, 'bad');
 }
 
-function setView(v) {
-  if (live.view && live.view.bitmap && live.view.bitmap !== v.bitmap) live.view.bitmap.close();
-  live.view = v;
+/** 영상에서 판 주변만 보이게 자르기 (판 위치가 바뀔 때만) */
+function layoutView() {
+  const v = hudEls.video, W = v.videoWidth, H = v.videoHeight;
+  if (!W || !H) return;
+  const r = live.grid ? regionAround(live.grid, 0.6, W, H) : (live.region || [0, 0, W, H]);
+  const o = live.region;
+  if (o && r.every((x, i) => Math.abs(x - o[i]) < 1)) return;
+  live.region = r;
+  const [x0, y0, rw, rh] = r;
+  hudEls.view.style.setProperty('--ar', (rw / rh).toFixed(4));
+  Object.assign(v.style, { width: `${(W / rw) * 100}%`, height: `${(H / rh) * 100}%`, left: `${(-x0 / rw) * 100}%`, top: `${(-y0 / rh) * 100}%` });
+  drawOverlay();
 }
 
-// 영상 트랙 방식: 받는 작업자가 잘라 보낸 장면
-function onView(view) {
-  if (!live.stream) { view.bitmap.close(); return; }
-  setView({ src: view.bitmap, bitmap: view.bitmap, srcRect: [0, 0, view.bitmap.width, view.bitmap.height], region: view.region });
-  drawLive();
-  capture.post({ cmd: 'viewAck' });
+/** 영상 위 투명 캔버스에 추천 단계 그리기 */
+function drawOverlay() {
+  const cv = hudEls.cv, ctx = cv.getContext('2d');
+  const rect = hudEls.view.getBoundingClientRect();
+  const win = cv.ownerDocument.defaultView || window;
+  const dpr = Math.min(2, win.devicePixelRatio || 1);
+  const Wc = Math.max(1, Math.round(rect.width * dpr)), Hc = Math.max(1, Math.round(rect.height * dpr));
+  if (cv.width !== Wc || cv.height !== Hc) { cv.width = Wc; cv.height = Hc; } else ctx.clearRect(0, 0, Wc, Hc);
+  const fr = live.frame, g = fr && fr.ok && fr.grid ? fr.grid : null, r = live.region;
+  if (!g || !r || !live.stream) return;
+  const s = Wc / r[2], ox = r[0], oy = r[1];
+  const X = c => (g.x0 + c * g.P - ox) * s;
+  const Y = rr => (g.y0 + rr * g.Q - oy) * s;
+  const P = g.P * s, Q = g.Q * s, right = X(COLS);
+  const geo = {
+    X, Y, P, Q,
+    card(slot, col, wd, label) {
+      const cy = Y(LAYOUT.slot_y0 + slot * LAYOUT.slot_dy);
+      const x0 = right + 0.3 * P, x1 = right + 4.9 * P;
+      ctx.setLineDash([]); ctx.strokeStyle = col; ctx.lineWidth = wd;
+      ctx.strokeRect(x0, cy - 1.4 * Q, x1 - x0, 2.8 * Q);
+      const fs = Math.max(11, P * 0.36);
+      ctx.font = `700 ${fs}px ${FONT}`;
+      const tw = Math.max(2.4 * P, ctx.measureText(label).width + 12);
+      ctx.fillStyle = col; ctx.fillRect(x0, cy - 1.4 * Q, tw, 0.62 * Q);
+      ctx.fillStyle = '#fff'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillText(label, x0 + 6, cy - 1.09 * Q);
+    },
+    button(kind, col, wd, k2) {
+      const bx = right + 2.3 * P, by = Y(kind === 'dot' ? LAYOUT.dot_btn_y : LAYOUT.swap_btn_y);
+      ctx.setLineDash([]); ctx.strokeStyle = col; ctx.lineWidth = wd;
+      ctx.strokeRect(bx - 2.0 * P, by - 0.5 * Q, 4.0 * P, 1.0 * Q);
+      badge(ctx, bx - 2.0 * P, by, P, String(k2 + 1), '#0891b2');
+    },
+  };
+  drawSteps(ctx, geo, live.c.plan, live.c.next, liveShapes());
 }
 
-// 영상 요소 방식(다른 브라우저): 시계에 맞춰 영상에서 바로 그리고, 인식이 쉬면 판 주변을 잘라 넘긴다
+/** 안내 띠·추천 목록·능력 줄·덧그림 (바뀐 것이 있을 때만) */
+let liveInfoKey = '';
+function refreshLive(force = false) {
+  const fr = live.frame, shapes = liveShapes();
+  const banner = live.stream ? bannerText(live.c, fr && fr.ok, fr && !fr.ok ? fr.reason : '') : '화면 공유를 시작하세요';
+  const ability = '능력: ' + live.tracker.summary() + (live.c.note ? ' · ' + live.c.note : '');
+  const g = fr && fr.ok && fr.grid ? fr.grid : null;
+  const key = [live.c.plan ? live.c.plan.id : '-', live.c.next, live.c.computing, banner, ability, settings.rotDir, settings.flipAxis,
+               shapes.map(sh => (sh ? shapeKey(sh) : '')).join(';'), g ? [g.x0, g.y0, g.P, g.Q].join(',') : '', live.region].join('|');
+  if (key === liveInfoKey && !force) return;
+  liveInfoKey = key;
+  hudEls.banner.textContent = banner;
+  hudEls.banner.classList.toggle('stuck', !!(live.c.plan && live.c.plan.stuck));
+  renderPlanList(hudEls.plan, live.c, shapes);
+  hudEls.ability.textContent = ability;
+  drawOverlay();
+}
+const liveChanged = () => refreshLive(true);
+
+// 영상 트랙을 직접 못 읽는 브라우저의 인식 + 영상 PiP 그림 합치기 (작업자 시계: 탭이 뒤에 있어도 느려지지 않게)
 function onTick() {
-  const v = $('#video');
-  if (!live.stream || live.mode !== 'video') return;
+  if (!live.stream) return;
+  const v = hudEls.video;
   if (v.paused) v.play().catch(() => {});
   if (v.readyState < 2 || !v.videoWidth) return;
-  const W = v.videoWidth, H = v.videoHeight;
-  const region = live.grid ? regionAround(live.grid, 0.6, W, H) : [0, 0, W, H];
-  setView({ src: v, srcRect: region, region });
-  drawLive();
+  if (live.videoPip) composePip();
+  if (live.mode !== 'video') return;
   const now = performance.now();
   if (live.anaBusy || now - live.lastAna < 120) return;
   live.anaBusy = true; live.lastAna = now;
+  const W = v.videoWidth, H = v.videoHeight;
   const ar = live.grid && live.margin !== null ? regionAround(live.grid, live.margin, W, H) : [0, 0, W, H];
   createImageBitmap(v, ar[0], ar[1], ar[2], ar[3])
     .then(bmp => vision.call({ cmd: 'frame', bitmap: bmp, x0: ar[0], y0: ar[1], W, H }, [bmp]))
     .then(r => onLiveResult(r.res, r.next))
     .catch(e => setLiveStatus('화면을 읽는 중 오류: ' + e.message, 'bad'))
     .finally(() => { live.anaBusy = false; });
+}
+
+function updateTicker() {
+  const on = !!live.stream && (live.mode === 'video' || !!live.videoPip);
+  capture.post({ cmd: 'ticker', on, interval: 33 });
 }
 
 function setLiveStatus(msg, cls = '') {
@@ -366,7 +434,7 @@ async function startShare() {
   }
   let stream;
   try {
-    stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30, max: 30 } }, audio: false });
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 60, max: 60 } }, audio: false });
   } catch (e) {
     setLiveStatus(e && e.name === 'NotAllowedError' ? '공유를 취소했어요.' : '화면 공유를 시작하지 못했어요: ' + e.message, 'warn');
     return;
@@ -375,49 +443,56 @@ async function startShare() {
   track.addEventListener('ended', () => stopShare('공유가 끝났어요.'));
   live.stream = stream;
   live.c = newCtx(); live.lastSig = null; live.prevSlots = null; live.frame = null;
-  live.grid = null; live.margin = null; live.anaBusy = false; live.lastAna = 0;
+  live.grid = null; live.margin = null; live.anaBusy = false; live.lastAna = 0; live.region = null;
   const learned = live.tracker.learned;
   live.tracker = new Tracker(); live.tracker.learned = learned;
   vision.post({ cmd: 'reset' });
+  const v = hudEls.video;
+  v.srcObject = stream;
+  v.play().catch(() => { /* 첫 프레임이 오면 다시 */ });
   live.mode = null;
   if (typeof MediaStreamTrackProcessor === 'function') {
     try {
-      const proc = new MediaStreamTrackProcessor({ track });
+      live.anaTrack = track.clone();         // 인식용 사본 (화면 표시는 원본 영상이 그대로)
+      const proc = new MediaStreamTrackProcessor({ track: live.anaTrack });
       capture.post({ cmd: 'stream', readable: proc.readable, interval: 120 }, [proc.readable]);
       live.mode = 'stream';
-    } catch { live.mode = null; }
+    } catch {
+      if (live.anaTrack) { live.anaTrack.stop(); live.anaTrack = null; }
+      live.mode = null;
+    }
   }
-  if (live.mode !== 'stream') {
-    const v = $('#video');
-    v.srcObject = stream;
-    v.play().catch(() => { /* 첫 프레임이 오면 다시 */ });
-    capture.post({ cmd: 'ticker', on: true, interval: 33 });
-    live.mode = 'video';
-  }
+  if (live.mode !== 'stream') live.mode = 'video';
+  updateTicker();
   $('#share-btn').textContent = '공유 중지';
   $('#pip-btn').disabled = false; $('#refind-btn').disabled = false; $('#to-editor-btn').disabled = false;
-  $('#live-empty').hidden = true; $('#hud').hidden = false;
+  $('#live-empty').hidden = true; hudEls.hud.hidden = false;
+  hudEls.msg.textContent = '공유 화면을 받는 중…'; hudEls.msg.hidden = false;
   setLiveStatus('게임판을 찾는 중…');
   liveChanged();
 }
 
 function stopShare(msg = '공유를 멈췄어요.') {
   if (live.stream) for (const t of live.stream.getTracks()) t.stop();
+  if (live.anaTrack) { live.anaTrack.stop(); live.anaTrack = null; }
   live.stream = null; live.mode = null;
   capture.post({ cmd: 'stop' });
-  capture.post({ cmd: 'ticker', on: false });
-  const v = $('#video'); v.srcObject = null;
-  if (live.view && live.view.src === v) live.view = null;
+  updateTicker();
+  hudEls.video.srcObject = null;
+  hudEls.msg.textContent = '공유를 멈췄어요'; hudEls.msg.hidden = false;
+  if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {});
   $('#share-btn').textContent = '화면 공유 시작';
   $('#refind-btn').disabled = true;
   if (!live.pip) $('#pip-btn').disabled = true;
   setLiveStatus(msg);
+  liveChanged();
 }
 
 function refind() {
   vision.post({ cmd: 'reset' });
   capture.post({ cmd: 'reset' });
-  live.grid = null; live.margin = null;
+  live.grid = null; live.margin = null; live.region = null;
+  layoutView();
   setLiveStatus('게임판을 다시 찾는 중…');
 }
 
@@ -425,9 +500,10 @@ function onLiveResult(res, next) {
   if (!live.stream) return;
   if (next) { live.grid = next.grid; live.margin = next.margin; }
   live.frame = res;
+  layoutView();
   if (!res.ok) {
     setLiveStatus(res.reason || '게임판을 찾는 중…', 'warn');
-    renderLiveInfo();
+    refreshLive();
     return;
   }
   const fully = res.clean && res.slots.every(s => s.status === 'used' || (s.status === 'ok' && s.block >= 0));
@@ -446,7 +522,7 @@ function onLiveResult(res, next) {
     else if (res.slots.some(s => s.status === 'ok' && s.block < 0)) why = '19종에 없는 조각 모양이에요';
     setLiveStatus(why, 'warn');
   }
-  renderLiveInfo();
+  refreshLive();
 }
 
 function observeTurns(fr) {
@@ -483,85 +559,12 @@ function acceptLive(fr, rows) {
   ensurePlan(live.c, st, liveChanged);
 }
 
-const hudEls = { cv: $('#live-cv'), plan: $('#live-plan'), ability: $('#live-ability'), hud: $('#hud') };
-
-function drawLive() {
-  const cv = hudEls.cv;
-  const ctx = cv.getContext('2d');
-  const v = live.view, fr = live.frame;
-  const band = 44;
-  if (!v) {
-    cv.width = 600; cv.height = 360;
-    ctx.fillStyle = '#121826'; ctx.fillRect(0, 0, cv.width, cv.height);
-    outlinedText(ctx, live.stream ? '공유 화면을 받는 중…' : '화면 공유를 시작하세요', cv.width / 2, cv.height / 2, 18, '#cbd5e1');
-  } else {
-    const [ox, oy, rw, rh] = v.region;
-    const k = Math.min(2, 760 / rw, 900 / rh);
-    const W = Math.round(rw * k), H = Math.round(rh * k) + band;
-    if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
-    ctx.imageSmoothingQuality = 'medium';
-    ctx.drawImage(v.src, v.srcRect[0], v.srcRect[1], v.srcRect[2], v.srcRect[3], 0, band, W, H - band);
-    const g = fr && fr.ok && fr.grid ? fr.grid : null;
-    if (g) {
-      const s = k;
-      const X = c => (g.x0 + c * g.P - ox) * s;
-      const Y = r => band + (g.y0 + r * g.Q - oy) * s;
-      const P = g.P * s, Q = g.Q * s, right = X(COLS);
-      const geo = {
-        X, Y, P, Q,
-        card(slot, col, wd, label) {
-          const cy = band + (g.y0 + (LAYOUT.slot_y0 + slot * LAYOUT.slot_dy) * g.Q - oy) * s;
-          const x0 = right + 0.3 * P, x1 = right + 4.9 * P;
-          ctx.setLineDash([]); ctx.strokeStyle = col; ctx.lineWidth = wd;
-          ctx.strokeRect(x0, cy - 1.4 * Q, x1 - x0, 2.8 * Q);
-          const fs = Math.max(11, P * 0.36);
-          ctx.font = `700 ${fs}px ${FONT}`;
-          const tw = Math.max(2.4 * P, ctx.measureText(label).width + 12);
-          ctx.fillStyle = col; ctx.fillRect(x0, cy - 1.4 * Q, tw, 0.62 * Q);
-          ctx.fillStyle = '#fff'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-          ctx.fillText(label, x0 + 6, cy - 1.09 * Q);
-        },
-        button(kind, col, wd, k2) {
-          const bx = right + 2.3 * P, by = Y(kind === 'dot' ? LAYOUT.dot_btn_y : LAYOUT.swap_btn_y);
-          ctx.setLineDash([]); ctx.strokeStyle = col; ctx.lineWidth = wd;
-          ctx.strokeRect(bx - 2.0 * P, by - 0.5 * Q, 4.0 * P, 1.0 * Q);
-          badge(ctx, bx - 2.0 * P, by, P, String(k2 + 1), '#0891b2');
-        },
-      };
-      drawSteps(ctx, geo, live.c.plan, live.c.next, liveShapes());
-    }
-  }
-  // 위쪽 안내 띠
-  const ok = fr && fr.ok;
-  const text = bannerText(live.c, ok, fr && !fr.ok ? fr.reason : '');
-  const stuck = live.c.plan && live.c.plan.stuck;
-  ctx.fillStyle = stuck ? '#7f1d1d' : '#0f172a';
-  ctx.fillRect(0, 0, cv.width, band);
-  ctx.fillStyle = stuck ? '#ff3b3b' : '#334155'; ctx.fillRect(0, band - 2, cv.width, 2);
-  outlinedText(ctx, text, cv.width / 2, band / 2, Math.min(20, Math.max(13, cv.width / 34)));
-}
-
-/** 추천 목록·능력 줄 (인식 결과나 계획이 바뀔 때만 다시 그림) */
-let liveInfoKey = '';
-function renderLiveInfo() {
-  const shapes = liveShapes();
-  const ability = '능력: ' + live.tracker.summary() + (live.c.note ? ' · ' + live.c.note : '');
-  const key = [live.c.plan ? live.c.plan.id : '-', live.c.next, live.c.computing, ability, settings.rotDir, settings.flipAxis,
-               shapes.map(sh => (sh ? shapeKey(sh) : '')).join(';')].join('|');
-  if (key === liveInfoKey) return;
-  liveInfoKey = key;
-  renderPlanList(hudEls.plan, live.c, shapes);
-  hudEls.ability.textContent = ability;
-}
-
-function liveChanged() { renderLiveInfo(); drawLive(); }
-
 // 항상 위 HUD 창
 async function openPip() {
   if (live.pip) { live.pip.close(); return; }
   let pw = null;
   if ('documentPictureInPicture' in window) {
-    try { pw = await window.documentPictureInPicture.requestWindow({ width: 440, height: 720 }); } catch { pw = null; }
+    try { pw = await window.documentPictureInPicture.requestWindow({ width: 460, height: 760 }); } catch { pw = null; }
   }
   if (pw) {
     for (const ss of document.styleSheets) {
@@ -577,22 +580,26 @@ async function openPip() {
     pw.document.body.className = 'pip';
     const hud = hudEls.hud;
     pw.document.body.append(hud);
-    pw.addEventListener('resize', drawLive);
+    hudEls.video.play().catch(() => {});
+    pw.addEventListener('resize', drawOverlay);
     $('#pip-home').hidden = false;
     live.pip = pw;
     $('#pip-btn').textContent = 'HUD 창 닫기';
+    requestAnimationFrame(drawOverlay);
     pw.addEventListener('pagehide', () => {
       $('#hud-home').append(hud);
+      hudEls.video.play().catch(() => {});
       $('#pip-home').hidden = true;
       live.pip = null;
       $('#pip-btn').textContent = '항상 위 HUD 창';
+      requestAnimationFrame(drawOverlay);
     });
     return;
   }
-  // 문서 PiP를 못 쓰면 그림만 작은 창으로 (영상 PiP)
-  const cv = hudEls.cv;
+  // 문서 PiP를 못 쓰면 영상 PiP: 판 주변 영상 + 덧그림을 합친 그림을 작은 창으로
   if (document.pictureInPictureElement) { document.exitPictureInPicture().catch(() => {}); return; }
-  if (!cv.captureStream || !document.pictureInPictureEnabled) {
+  const pc = document.createElement('canvas');
+  if (!pc.captureStream || !document.pictureInPictureEnabled) {
     toast('이 브라우저는 항상 위 창을 지원하지 않아요 (Chrome·Edge 권장).');
     return;
   }
@@ -600,10 +607,31 @@ async function openPip() {
   if (!pv) {
     pv = document.createElement('video');
     pv.id = 'pip-video'; pv.muted = true; pv.playsInline = true; pv.className = 'hidden-video';
+    pv.addEventListener('leavepictureinpicture', () => { live.videoPip = null; updateTicker(); });
     document.body.append(pv);
   }
-  pv.srcObject = cv.captureStream(30);
-  try { await pv.play(); await pv.requestPictureInPicture(); } catch (e) { toast('HUD 창을 열지 못했어요: ' + e.message); }
+  live.videoPip = pc;
+  composePip();
+  updateTicker();
+  pv.srcObject = pc.captureStream(30);
+  try { await pv.play(); await pv.requestPictureInPicture(); } catch (e) {
+    live.videoPip = null; updateTicker();
+    toast('HUD 창을 열지 못했어요: ' + e.message);
+  }
+}
+
+function composePip() {
+  const pc = live.videoPip, v = hudEls.video, r = live.region;
+  if (!pc || !r || !v.videoWidth) return;
+  const band = 40, k = Math.min(1, 640 / r[2]);
+  const W = Math.round(r[2] * k), H = Math.round(r[3] * k) + band;
+  if (pc.width !== W || pc.height !== H) { pc.width = W; pc.height = H; }
+  const ctx = pc.getContext('2d');
+  ctx.drawImage(v, r[0], r[1], r[2], r[3], 0, band, W, H - band);
+  ctx.drawImage(hudEls.cv, 0, band, W, H - band);
+  ctx.fillStyle = hudEls.banner.classList.contains('stuck') ? '#7f1d1d' : '#0f172a';
+  ctx.fillRect(0, 0, W, band);
+  outlinedText(ctx, hudEls.banner.textContent, W / 2, band / 2, Math.min(18, Math.max(12, W / 30)));
 }
 
 function liveToEditor() {
@@ -950,7 +978,7 @@ function selectTab(name) {
     $(`#tab-${t}`).hidden = t !== name;
   }
   store.set('tab', name);
-  if (name === 'edit') drawEditor(); else liveChanged();
+  if (name === 'edit') drawEditor(); else { layoutView(); liveChanged(); }
 }
 
 function saveTurnSettings() {
@@ -978,6 +1006,10 @@ function init() {
   $('#share-btn').addEventListener('click', () => (live.stream ? stopShare() : startShare()));
   $('#pip-btn').addEventListener('click', openPip);
   $('#refind-btn').addEventListener('click', refind);
+  hudEls.video.addEventListener('loadedmetadata', layoutView);
+  hudEls.video.addEventListener('resize', () => { live.region = null; layoutView(); });
+  hudEls.video.addEventListener('playing', () => { hudEls.msg.hidden = true; });
+  if (typeof ResizeObserver === 'function') new ResizeObserver(() => drawOverlay()).observe(hudEls.view);
   $('#to-editor-btn').addEventListener('click', liveToEditor);
   $('#fix-btn').addEventListener('click', () => {
     const v = id => ($(id).value === '' ? undefined : Math.max(0, Math.min(7, parseInt($(id).value, 10) || 0)));
