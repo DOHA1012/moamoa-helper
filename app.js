@@ -71,6 +71,7 @@ function fatal(msg) {
 
 const engine = rpc(new URL('./engine-worker.js', import.meta.url));
 const vision = rpc(new URL('./vision-worker.js', import.meta.url), onVisionEvent);
+const capture = rpc(new URL('./capture-worker.js', import.meta.url), onCaptureEvent);
 let seed = 0;
 async function decide(state) {
   const r = await engine.call({ cmd: 'decide', state, opt: engineOpt(), seed: ++seed });
@@ -106,6 +107,7 @@ function advance(c, rows, tracker) {
   return false;
 }
 
+let planSeq = 0;
 const stateKey = st => [st.rows.join(','), st.hand.join(','), st.dots, st.swaps, st.nextIn, st.lines, JSON.stringify(st.icons)].join('|');
 
 function pushHistory(c) {
@@ -150,6 +152,7 @@ async function ensurePlan(c, st, onChange) {
   c.pending = null; c.computing = false;
   pushHistory(c);
   c.plan = buildPlan(cloneState(st), st.hand, res);
+  c.plan.id = ++planSeq;
   c.next = 0; c.expect = st.rows.slice();
   onChange();
 }
@@ -279,44 +282,81 @@ function renderPlanList(el, c, shapes) {
 }
 
 // ================================================================= 실시간 화면 공유
+// 미리보기는 매 프레임(최대 30fps) 그리고, 인식은 따로 쉬는 틈마다 돌린다 → 인식이 느려도 화면은 부드럽다.
 const live = {
   stream: null, c: newCtx(), tracker: new Tracker(), lastSig: null, frame: null, view: null,
-  prevSlots: null, mode: null, busy: false, pip: null,
+  prevSlots: null, mode: null, pip: null, grid: null, margin: null, anaBusy: false, lastAna: 0,
 };
 live.tracker.learned = store.get('learned', { panel: [], badge: [] });
 vision.post({ cmd: 'learned', learned: live.tracker.learned });
+{
+  const ch = new MessageChannel();            // 영상 받는 작업자 → 인식 작업자 직통
+  capture.post({ cmd: 'port', port: ch.port1 }, [ch.port1]);
+  vision.post({ cmd: 'port', port: ch.port2 }, [ch.port2]);
+}
 
 function liveShapes() {
   const fr = live.frame;
   return fr && fr.ok ? fr.slots.map(s => (s.status === 'ok' ? s.shape : null)) : [null, null, null];
 }
 
+/** 판(+패널) 둘레 m칸 범위 [x, y, w, h] (화면 좌표, 화면 안으로 자름) */
+function regionAround(g, m, W, H) {
+  const mm = m * g.P;
+  const x0 = Math.max(0, Math.trunc(g.x0 - mm)), y0 = Math.max(0, Math.trunc(g.y0 - mm));
+  const x1 = Math.min(W, Math.ceil(g.x0 + 15 * g.P + mm)), y1 = Math.min(H, Math.ceil(g.y0 + 16 * g.Q + mm));
+  return x1 - x0 > 8 && y1 - y0 > 8 ? [x0, y0, x1 - x0, y1 - y0] : [0, 0, W, H];
+}
+
 function onVisionEvent(m) {
-  if (m.kind === 'live') onLiveResult(m.res, m.view);
-  else if (m.kind === 'tick') grabVideoFrame();
+  if (m.kind === 'live') onLiveResult(m.res, m.next);
+}
+
+function onCaptureEvent(m) {
+  if (m.kind === 'view') onView(m.view);
+  else if (m.kind === 'tick') onTick();
   else if (m.kind === 'ended') { if (live.stream) stopShare('공유가 끝났어요.'); }
   else if (m.kind === 'error') setLiveStatus('화면을 읽는 중 오류: ' + m.error, 'bad');
 }
 
-async function grabVideoFrame() {
+function setView(v) {
+  if (live.view && live.view.bitmap && live.view.bitmap !== v.bitmap) live.view.bitmap.close();
+  live.view = v;
+}
+
+// 영상 트랙 방식: 받는 작업자가 잘라 보낸 장면
+function onView(view) {
+  if (!live.stream) { view.bitmap.close(); return; }
+  setView({ src: view.bitmap, bitmap: view.bitmap, srcRect: [0, 0, view.bitmap.width, view.bitmap.height], region: view.region });
+  drawLive();
+  capture.post({ cmd: 'viewAck' });
+}
+
+// 영상 요소 방식(다른 브라우저): 시계에 맞춰 영상에서 바로 그리고, 인식이 쉬면 판 주변을 잘라 넘긴다
+function onTick() {
   const v = $('#video');
-  if (v.paused && live.stream) v.play().catch(() => {});
-  if (live.busy || !live.stream || v.readyState < 2 || !v.videoWidth) return;
-  live.busy = true;
-  try {
-    const bmp = await createImageBitmap(v);
-    const r = await vision.call({ cmd: 'frame', bitmap: bmp }, [bmp]);
-    onLiveResult(r.res, r.view);
-  } catch (e) {
-    setLiveStatus('화면을 읽는 중 오류: ' + e.message, 'bad');
-  } finally {
-    live.busy = false;
-  }
+  if (!live.stream || live.mode !== 'video') return;
+  if (v.paused) v.play().catch(() => {});
+  if (v.readyState < 2 || !v.videoWidth) return;
+  const W = v.videoWidth, H = v.videoHeight;
+  const region = live.grid ? regionAround(live.grid, 0.6, W, H) : [0, 0, W, H];
+  setView({ src: v, srcRect: region, region });
+  drawLive();
+  const now = performance.now();
+  if (live.anaBusy || now - live.lastAna < 120) return;
+  live.anaBusy = true; live.lastAna = now;
+  const ar = live.grid && live.margin !== null ? regionAround(live.grid, live.margin, W, H) : [0, 0, W, H];
+  createImageBitmap(v, ar[0], ar[1], ar[2], ar[3])
+    .then(bmp => vision.call({ cmd: 'frame', bitmap: bmp, x0: ar[0], y0: ar[1], W, H }, [bmp]))
+    .then(r => onLiveResult(r.res, r.next))
+    .catch(e => setLiveStatus('화면을 읽는 중 오류: ' + e.message, 'bad'))
+    .finally(() => { live.anaBusy = false; });
 }
 
 function setLiveStatus(msg, cls = '') {
   const el = $('#live-status');
-  el.textContent = msg; el.className = 'status' + (cls ? ' ' + cls : '');
+  if (el.textContent !== msg) el.textContent = msg;
+  el.className = 'status' + (cls ? ' ' + cls : '');
 }
 
 async function startShare() {
@@ -326,7 +366,7 @@ async function startShare() {
   }
   let stream;
   try {
-    stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 10, max: 15 } }, audio: false });
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30, max: 30 } }, audio: false });
   } catch (e) {
     setLiveStatus(e && e.name === 'NotAllowedError' ? '공유를 취소했어요.' : '화면 공유를 시작하지 못했어요: ' + e.message, 'warn');
     return;
@@ -335,6 +375,7 @@ async function startShare() {
   track.addEventListener('ended', () => stopShare('공유가 끝났어요.'));
   live.stream = stream;
   live.c = newCtx(); live.lastSig = null; live.prevSlots = null; live.frame = null;
+  live.grid = null; live.margin = null; live.anaBusy = false; live.lastAna = 0;
   const learned = live.tracker.learned;
   live.tracker = new Tracker(); live.tracker.learned = learned;
   vision.post({ cmd: 'reset' });
@@ -342,7 +383,7 @@ async function startShare() {
   if (typeof MediaStreamTrackProcessor === 'function') {
     try {
       const proc = new MediaStreamTrackProcessor({ track });
-      vision.post({ cmd: 'stream', readable: proc.readable, interval: 180 }, [proc.readable]);
+      capture.post({ cmd: 'stream', readable: proc.readable, interval: 120 }, [proc.readable]);
       live.mode = 'stream';
     } catch { live.mode = null; }
   }
@@ -350,38 +391,43 @@ async function startShare() {
     const v = $('#video');
     v.srcObject = stream;
     v.play().catch(() => { /* 첫 프레임이 오면 다시 */ });
-    vision.post({ cmd: 'ticker', on: true, interval: 200 });
+    capture.post({ cmd: 'ticker', on: true, interval: 33 });
     live.mode = 'video';
   }
   $('#share-btn').textContent = '공유 중지';
   $('#pip-btn').disabled = false; $('#refind-btn').disabled = false; $('#to-editor-btn').disabled = false;
   $('#live-empty').hidden = true; $('#hud').hidden = false;
   setLiveStatus('게임판을 찾는 중…');
-  drawLive();
+  liveChanged();
 }
 
 function stopShare(msg = '공유를 멈췄어요.') {
   if (live.stream) for (const t of live.stream.getTracks()) t.stop();
   live.stream = null; live.mode = null;
-  vision.post({ cmd: 'stop' });
-  vision.post({ cmd: 'ticker', on: false });
+  capture.post({ cmd: 'stop' });
+  capture.post({ cmd: 'ticker', on: false });
   const v = $('#video'); v.srcObject = null;
+  if (live.view && live.view.src === v) live.view = null;
   $('#share-btn').textContent = '화면 공유 시작';
   $('#refind-btn').disabled = true;
   if (!live.pip) $('#pip-btn').disabled = true;
   setLiveStatus(msg);
 }
 
-function onLiveResult(res, view) {
-  if (!live.stream) { if (view && view.bitmap) view.bitmap.close(); return; }
-  if (view && view.bitmap) {
-    if (live.view && live.view.bitmap) live.view.bitmap.close();
-    live.view = view;
-  }
+function refind() {
+  vision.post({ cmd: 'reset' });
+  capture.post({ cmd: 'reset' });
+  live.grid = null; live.margin = null;
+  setLiveStatus('게임판을 다시 찾는 중…');
+}
+
+function onLiveResult(res, next) {
+  if (!live.stream) return;
+  if (next) { live.grid = next.grid; live.margin = next.margin; }
   live.frame = res;
   if (!res.ok) {
     setLiveStatus(res.reason || '게임판을 찾는 중…', 'warn');
-    drawLive();
+    renderLiveInfo();
     return;
   }
   const fully = res.clean && res.slots.every(s => s.status === 'used' || (s.status === 'ok' && s.block >= 0));
@@ -390,7 +436,7 @@ function onLiveResult(res, view) {
     const sig = rows.join(',') + '|' + res.slots.map(s => s.status + ':' + (s.shape ? shapeKey(s.shape) : '')).join(';');
     if (sig === live.lastSig) acceptLive(res, rows);
     live.lastSig = sig;
-    setLiveStatus(`읽는 중 · ${res.ms.toFixed(0)}ms`);
+    setLiveStatus(`읽는 중 · 인식 ${res.ms.toFixed(0)}ms`);
   } else {
     const occl = res.slots.map((s, k) => (s.status === 'occluded' ? k + 1 : 0)).filter(Boolean);
     let why = '판을 가리는 것이 있어서 기다리는 중';
@@ -400,7 +446,7 @@ function onLiveResult(res, view) {
     else if (res.slots.some(s => s.status === 'ok' && s.block < 0)) why = '19종에 없는 조각 모양이에요';
     setLiveStatus(why, 'warn');
   }
-  drawLive();
+  renderLiveInfo();
 }
 
 function observeTurns(fr) {
@@ -434,7 +480,7 @@ function acceptLive(fr, rows) {
   const hand = fr.slots.map(s => (s.status === 'ok' && s.block >= 0 ? s.block : -1));
   const st = tr.state(rows);
   st.hand = hand;
-  ensurePlan(live.c, st, drawLive);
+  ensurePlan(live.c, st, liveChanged);
 }
 
 const hudEls = { cv: $('#live-cv'), plan: $('#live-plan'), ability: $('#live-ability'), hud: $('#hud') };
@@ -444,21 +490,20 @@ function drawLive() {
   const ctx = cv.getContext('2d');
   const v = live.view, fr = live.frame;
   const band = 44;
-  if (!v || !v.bitmap) {
+  if (!v) {
     cv.width = 600; cv.height = 360;
     ctx.fillStyle = '#121826'; ctx.fillRect(0, 0, cv.width, cv.height);
     outlinedText(ctx, live.stream ? '공유 화면을 받는 중…' : '화면 공유를 시작하세요', cv.width / 2, cv.height / 2, 18, '#cbd5e1');
   } else {
-    const bw = v.bitmap.width, bh = v.bitmap.height;
-    const k = Math.min(2, 760 / bw, 900 / bh);
-    const W = Math.round(bw * k), H = Math.round(bh * k) + band;
+    const [ox, oy, rw, rh] = v.region;
+    const k = Math.min(2, 760 / rw, 900 / rh);
+    const W = Math.round(rw * k), H = Math.round(rh * k) + band;
     if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
-    ctx.fillStyle = '#0d121c'; ctx.fillRect(0, 0, W, H);
-    ctx.imageSmoothingQuality = 'high';
-    ctx.drawImage(v.bitmap, 0, band, W, H - band);
+    ctx.imageSmoothingQuality = 'medium';
+    ctx.drawImage(v.src, v.srcRect[0], v.srcRect[1], v.srcRect[2], v.srcRect[3], 0, band, W, H - band);
     const g = fr && fr.ok && fr.grid ? fr.grid : null;
     if (g) {
-      const s = k * (v.sc || 1), ox = v.x0, oy = v.y0;
+      const s = k;
       const X = c => (g.x0 + c * g.P - ox) * s;
       const Y = r => band + (g.y0 + r * g.Q - oy) * s;
       const P = g.P * s, Q = g.Q * s, right = X(COLS);
@@ -494,10 +539,22 @@ function drawLive() {
   ctx.fillRect(0, 0, cv.width, band);
   ctx.fillStyle = stuck ? '#ff3b3b' : '#334155'; ctx.fillRect(0, band - 2, cv.width, 2);
   outlinedText(ctx, text, cv.width / 2, band / 2, Math.min(20, Math.max(13, cv.width / 34)));
-
-  renderPlanList(hudEls.plan, live.c, liveShapes());
-  hudEls.ability.textContent = '능력: ' + live.tracker.summary() + (live.c.note ? ' · ' + live.c.note : '');
 }
+
+/** 추천 목록·능력 줄 (인식 결과나 계획이 바뀔 때만 다시 그림) */
+let liveInfoKey = '';
+function renderLiveInfo() {
+  const shapes = liveShapes();
+  const ability = '능력: ' + live.tracker.summary() + (live.c.note ? ' · ' + live.c.note : '');
+  const key = [live.c.plan ? live.c.plan.id : '-', live.c.next, live.c.computing, ability, settings.rotDir, settings.flipAxis,
+               shapes.map(sh => (sh ? shapeKey(sh) : '')).join(';')].join('|');
+  if (key === liveInfoKey) return;
+  liveInfoKey = key;
+  renderPlanList(hudEls.plan, live.c, shapes);
+  hudEls.ability.textContent = ability;
+}
+
+function liveChanged() { renderLiveInfo(); drawLive(); }
 
 // 항상 위 HUD 창
 async function openPip() {
@@ -545,7 +602,7 @@ async function openPip() {
     pv.id = 'pip-video'; pv.muted = true; pv.playsInline = true; pv.className = 'hidden-video';
     document.body.append(pv);
   }
-  pv.srcObject = cv.captureStream(8);
+  pv.srcObject = cv.captureStream(30);
   try { await pv.play(); await pv.requestPictureInPicture(); } catch (e) { toast('HUD 창을 열지 못했어요: ' + e.message); }
 }
 
@@ -893,7 +950,7 @@ function selectTab(name) {
     $(`#tab-${t}`).hidden = t !== name;
   }
   store.set('tab', name);
-  if (name === 'edit') drawEditor(); else drawLive();
+  if (name === 'edit') drawEditor(); else liveChanged();
 }
 
 function saveTurnSettings() {
@@ -911,8 +968,8 @@ function init() {
     live.c.history = [];
   });
   saveTurnSettings();
-  $('#rot-dir').addEventListener('change', e => { settings.rotDir = e.target.value || null; saveTurnSettings(); drawEditor(); drawLive(); });
-  $('#flip-axis').addEventListener('change', e => { settings.flipAxis = e.target.value || null; saveTurnSettings(); drawEditor(); drawLive(); });
+  $('#rot-dir').addEventListener('change', e => { settings.rotDir = e.target.value || null; saveTurnSettings(); drawEditor(); liveChanged(); });
+  $('#flip-axis').addEventListener('change', e => { settings.flipAxis = e.target.value || null; saveTurnSettings(); drawEditor(); liveChanged(); });
 
   $('#tab-btn-live').addEventListener('click', () => selectTab('live'));
   $('#tab-btn-edit').addEventListener('click', () => selectTab('edit'));
@@ -920,7 +977,7 @@ function init() {
   // 실시간
   $('#share-btn').addEventListener('click', () => (live.stream ? stopShare() : startShare()));
   $('#pip-btn').addEventListener('click', openPip);
-  $('#refind-btn').addEventListener('click', () => { vision.post({ cmd: 'reset' }); setLiveStatus('게임판을 다시 찾는 중…'); });
+  $('#refind-btn').addEventListener('click', refind);
   $('#to-editor-btn').addEventListener('click', liveToEditor);
   $('#fix-btn').addEventListener('click', () => {
     const v = id => ($(id).value === '' ? undefined : Math.max(0, Math.min(7, parseInt($(id).value, 10) || 0)));
@@ -928,7 +985,7 @@ function init() {
     live.c.plan = null; live.c.history = [];
     for (const id of ['#fix-dots', '#fix-swaps', '#fix-next']) $(id).value = '';
     toast('능력 값을 고쳤어요. 다음 화면부터 반영돼요.');
-    drawLive();
+    liveChanged();
   });
 
   // 편집기
